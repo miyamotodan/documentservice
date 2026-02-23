@@ -2,6 +2,7 @@ package it.aw.documentingest.controller;
 
 import it.aw.documentingest.model.ChunkingParams;
 import it.aw.documentingest.model.DocumentRecord;
+import it.aw.documentingest.model.DocumentSummary;
 import it.aw.documentingest.model.SearchResult;
 import it.aw.documentingest.model.StoreStats;
 import it.aw.documentingest.registry.DocumentRegistry;
@@ -65,7 +66,7 @@ public class DocumentController {
      *        -F "file=@faq.txt"
      */
     @PostMapping("/ingest")
-    public ResponseEntity<DocumentRecord> ingest(
+    public ResponseEntity<DocumentSummary> ingest(
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "chunkSize", defaultValue = "" + ChunkingParams.DEFAULT_CHUNK_SIZE) int chunkSize,
             @RequestParam(value = "overlap",   defaultValue = "" + ChunkingParams.DEFAULT_OVERLAP)    int overlap) {
@@ -79,8 +80,8 @@ public class DocumentController {
             return ResponseEntity.badRequest().build();
         }
         try {
-            DocumentRecord record = ingestionService.ingest(file, params);
-            return ResponseEntity.ok(record);
+            DocumentSummary summary = ingestionService.ingest(file, params);
+            return ResponseEntity.ok(summary);
         } catch (Exception e) {
             log.error("Errore durante l'ingestione: {}", file.getOriginalFilename(), e);
             return ResponseEntity.internalServerError().build();
@@ -120,8 +121,8 @@ public class DocumentController {
      *   curl http://localhost:8889/api/documents
      */
     @GetMapping
-    public ResponseEntity<List<DocumentRecord>> listDocuments() {
-        return ResponseEntity.ok(registry.findAll());
+    public ResponseEntity<List<DocumentSummary>> listDocuments() {
+        return ResponseEntity.ok(registry.findAllAsSummary());
     }
 
     // -------------------------------------------------------------------------
@@ -139,9 +140,9 @@ public class DocumentController {
         StoreStats stats = new StoreStats(
                 registry.totalDocuments(),
                 registry.totalChunks(),
-                "InMemory",
+                "DuckDB",
                 "AllMiniLmL6V2Quantized",
-                true
+                false
         );
         return ResponseEntity.ok(stats);
     }
@@ -195,7 +196,7 @@ public class DocumentController {
      *        -F "file=@report_v2.pdf"
      */
     @PutMapping("/{filename}")
-    public ResponseEntity<DocumentRecord> reingestDocument(
+    public ResponseEntity<DocumentSummary> reingestDocument(
             @PathVariable String filename,
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "chunkSize", defaultValue = "" + ChunkingParams.DEFAULT_CHUNK_SIZE) int chunkSize,
@@ -213,8 +214,8 @@ public class DocumentController {
             return ResponseEntity.badRequest().build();
         }
         try {
-            DocumentRecord record = ingestionService.reingest(filename, file, params);
-            return ResponseEntity.ok(record);
+            DocumentSummary summary = ingestionService.reingest(filename, file, params);
+            return ResponseEntity.ok(summary);
         } catch (Exception e) {
             log.error("Errore durante il re-ingest: {}", filename, e);
             return ResponseEntity.internalServerError().build();

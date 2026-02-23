@@ -17,10 +17,8 @@ import java.util.stream.Collectors;
  * Esegue ricerche semantiche sull'embedding store.
  * <p>
  * Recupera un numero di candidati moltiplicato per SEARCH_MULTIPLIER,
- * quindi filtra i chunk di documenti non più attivi nel registry
- * (rimossi o sostituiti da un re-ingest). In questo modo la cancellazione
- * logica di un documento si riflette immediatamente nei risultati di ricerca
- * senza dover ricostruire l'InMemoryEmbeddingStore.
+ * filtra i chunk di documenti non più attivi nel registry (orfani),
+ * e arricchisce ogni risultato con i metadati di sezione e pagina.
  */
 @Service
 public class SearchService {
@@ -39,13 +37,6 @@ public class SearchService {
         this.registry = registry;
     }
 
-    /**
-     * Cerca i chunk più simili alla query testuale.
-     *
-     * @param query testo della query
-     * @param limit numero massimo di risultati da restituire
-     * @return lista di risultati ordinati per score decrescente
-     */
     public List<SearchResult> search(String query, int limit) {
         Embedding queryEmbedding = embeddingModel.embed(query).content();
         List<EmbeddingMatch<TextSegment>> candidates = embeddingStore.search(
@@ -61,12 +52,30 @@ public class SearchService {
                     return docId != null && registry.isActiveDocumentId(docId);
                 })
                 .limit(limit)
-                .map(m -> new SearchResult(
-                        m.score(),
-                        m.embedded().text(),
-                        m.embedded().metadata().getString("filename"),
-                        m.embedded().metadata().getString("documentId")
-                ))
+                .map(m -> {
+                    var meta = m.embedded().metadata();
+                    String  sectionPath  = meta.getString("section.path");
+                    String  sectionTitle = meta.getString("section.title");
+                    Integer sectionLevel = toInteger(meta.getString("section.level"));
+                    Integer pageStart    = toInteger(meta.getString("chunk.page_start"));
+                    Integer pageEnd      = toInteger(meta.getString("chunk.page_end"));
+                    return new SearchResult(
+                            m.score(),
+                            m.embedded().text(),
+                            meta.getString("filename"),
+                            meta.getString("documentId"),
+                            sectionPath,
+                            sectionTitle,
+                            sectionLevel != null ? sectionLevel : 0,
+                            pageStart,
+                            pageEnd
+                    );
+                })
                 .collect(Collectors.toList());
+    }
+
+    private Integer toInteger(String value) {
+        if (value == null) return null;
+        try { return Integer.parseInt(value); } catch (NumberFormatException e) { return null; }
     }
 }
