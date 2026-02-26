@@ -18,7 +18,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -42,14 +41,16 @@ public class DocumentRegistry {
 
     private static final String CREATE_TABLE = """
             CREATE TABLE IF NOT EXISTS documents (
-                filename       VARCHAR   PRIMARY KEY,
-                document_id    VARCHAR   NOT NULL,
+                document_id    VARCHAR   PRIMARY KEY,
+                project_id     VARCHAR   NOT NULL,
+                filename       VARCHAR   NOT NULL,
                 ingested_at    TIMESTAMP NOT NULL,
                 chunk_count    INTEGER   NOT NULL,
                 chunk_size     INTEGER   NOT NULL,
                 overlap        INTEGER   NOT NULL,
                 section_count  INTEGER   NOT NULL DEFAULT 0,
-                chunk_previews VARCHAR   NOT NULL
+                chunk_previews VARCHAR   NOT NULL,
+                chunk_ids      VARCHAR   NOT NULL
             )
             """;
 
@@ -77,17 +78,28 @@ public class DocumentRegistry {
         log.info("DocumentRegistry: tabella 'documents' pronta su {}", path.toAbsolutePath());
     }
 
-    /** Rileva schema obsoleto (senza section_count) e ricrea la tabella se necessario. */
+    /** Rileva schema obsoleto e ricrea la tabella se necessario. */
     private void migrateIfNeeded() throws SQLException {
-        boolean hasColumn;
+        java.util.Set<String> required = java.util.Set.of("section_count", "chunk_ids", "project_id");
+        java.util.Set<String> existing = new java.util.HashSet<>();
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT column_name FROM information_schema.columns " +
-                "WHERE table_name = 'documents' AND column_name = 'section_count'")) {
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'documents'")) {
             try (ResultSet rs = ps.executeQuery()) {
-                hasColumn = rs.next();
+                while (rs.next()) existing.add(rs.getString(1));
             }
         }
-        if (!hasColumn) {
+        boolean needsDrop = !existing.isEmpty() && !existing.containsAll(required);
+        // Verifica che document_id sia la chiave primaria (schema v3+)
+        if (!needsDrop && !existing.isEmpty()) {
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(
+                         "SELECT COUNT(*) FROM duckdb_constraints " +
+                         "WHERE table_name = 'documents' AND constraint_type = 'PRIMARY KEY' " +
+                         "AND list_contains(constraint_column_names, 'document_id')")) {
+                if (rs.next() && rs.getInt(1) == 0) needsDrop = true;
+            }
+        }
+        if (needsDrop) {
             try (Statement stmt = conn.createStatement()) {
                 stmt.execute("DROP TABLE IF EXISTS documents");
             }
@@ -105,39 +117,43 @@ public class DocumentRegistry {
         }
     }
 
-    public synchronized void register(DocumentRecord record) {
+    public synchronized void register(DocumentRecord record, List<String> chunkIds) {
         String sql = """
                 INSERT INTO documents
-                    (filename, document_id, ingested_at, chunk_count, chunk_size, overlap, section_count, chunk_previews)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (filename) DO UPDATE SET
-                    document_id    = EXCLUDED.document_id,
+                    (document_id, project_id, filename, ingested_at, chunk_count, chunk_size, overlap, section_count, chunk_previews, chunk_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    project_id     = EXCLUDED.project_id,
+                    filename       = EXCLUDED.filename,
                     ingested_at    = EXCLUDED.ingested_at,
                     chunk_count    = EXCLUDED.chunk_count,
                     chunk_size     = EXCLUDED.chunk_size,
                     overlap        = EXCLUDED.overlap,
                     section_count  = EXCLUDED.section_count,
-                    chunk_previews = EXCLUDED.chunk_previews
+                    chunk_previews = EXCLUDED.chunk_previews,
+                    chunk_ids      = EXCLUDED.chunk_ids
                 """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, record.filename());
-            ps.setString(2, record.documentId());
-            ps.setTimestamp(3, Timestamp.valueOf(record.ingestedAt()));
-            ps.setInt(4, record.chunkCount());
-            ps.setInt(5, record.chunkSize());
-            ps.setInt(6, record.overlap());
-            ps.setInt(7, record.sectionCount());
-            ps.setString(8, objectMapper.writeValueAsString(record.chunkPreviews()));
+            ps.setString(1, record.documentId());
+            ps.setString(2, record.projectId());
+            ps.setString(3, record.filename());
+            ps.setTimestamp(4, Timestamp.valueOf(record.ingestedAt()));
+            ps.setInt(5, record.chunkCount());
+            ps.setInt(6, record.chunkSize());
+            ps.setInt(7, record.overlap());
+            ps.setInt(8, record.sectionCount());
+            ps.setString(9, objectMapper.writeValueAsString(record.chunkPreviews()));
+            ps.setString(10, objectMapper.writeValueAsString(chunkIds));
             ps.executeUpdate();
         } catch (SQLException | JsonProcessingException e) {
             throw new RuntimeException("Errore salvataggio documento nel registry", e);
         }
     }
 
-    public synchronized Optional<DocumentRecord> findByFilename(String filename) {
+    public synchronized Optional<DocumentRecord> findById(String documentId) {
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT * FROM documents WHERE filename = ?")) {
-            ps.setString(1, filename);
+                "SELECT * FROM documents WHERE document_id = ?")) {
+            ps.setString(1, documentId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) return Optional.of(toRecord(rs));
             }
@@ -159,39 +175,52 @@ public class DocumentRegistry {
     }
 
     public synchronized List<DocumentSummary> findAllAsSummary() {
+        return findAllAsSummary(null);
+    }
+
+    public synchronized List<DocumentSummary> findAllAsSummary(String projectId) {
         List<DocumentSummary> result = new ArrayList<>();
-        String sql = "SELECT filename, document_id, ingested_at, chunk_count, chunk_size, overlap, section_count " +
-                     "FROM documents ORDER BY ingested_at DESC";
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            while (rs.next()) result.add(toSummary(rs));
+        String sql = projectId != null
+                ? "SELECT document_id, project_id, filename, ingested_at, chunk_count, chunk_size, overlap, section_count " +
+                  "FROM documents WHERE project_id = ? ORDER BY ingested_at DESC"
+                : "SELECT document_id, project_id, filename, ingested_at, chunk_count, chunk_size, overlap, section_count " +
+                  "FROM documents ORDER BY ingested_at DESC";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            if (projectId != null) ps.setString(1, projectId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) result.add(toSummary(rs));
+            }
         } catch (SQLException e) {
             throw new RuntimeException("Errore lettura registry (summary)", e);
         }
         return result;
     }
 
-    public synchronized boolean remove(String filename) {
+    /**
+     * Rimuove il documento dal registry e restituisce i chunk IDs da cancellare
+     * nell'embedding store. Ritorna {@link Optional#empty()} se il documento non esiste.
+     */
+    public synchronized Optional<List<String>> remove(String documentId) {
+        List<String> chunkIds;
         try (PreparedStatement ps = conn.prepareStatement(
-                "DELETE FROM documents WHERE filename = ?")) {
-            ps.setString(1, filename);
-            return ps.executeUpdate() > 0;
+                "SELECT chunk_ids FROM documents WHERE document_id = ?")) {
+            ps.setString(1, documentId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return Optional.empty();
+                chunkIds = objectMapper.readValue(rs.getString("chunk_ids"),
+                        new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+            }
+        } catch (SQLException | IOException e) {
+            throw new RuntimeException("Errore lettura chunk_ids dal registry", e);
+        }
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM documents WHERE document_id = ?")) {
+            ps.setString(1, documentId);
+            ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException("Errore rimozione documento dal registry", e);
         }
-    }
-
-    /** Verifica se il documentId dato appartiene a un documento attualmente attivo. */
-    public synchronized boolean isActiveDocumentId(String documentId) {
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT 1 FROM documents WHERE document_id = ? LIMIT 1")) {
-            ps.setString(1, documentId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        } catch (SQLException e) {
-            throw new RuntimeException("Errore verifica documentId nel registry", e);
-        }
+        return Optional.of(chunkIds);
     }
 
     public synchronized int totalDocuments() {
@@ -214,8 +243,9 @@ public class DocumentRegistry {
 
     private DocumentRecord toRecord(ResultSet rs) throws SQLException, IOException {
         return new DocumentRecord(
-                rs.getString("filename"),
+                rs.getString("project_id"),
                 rs.getString("document_id"),
+                rs.getString("filename"),
                 rs.getTimestamp("ingested_at").toLocalDateTime(),
                 rs.getInt("chunk_count"),
                 rs.getInt("chunk_size"),
@@ -227,8 +257,9 @@ public class DocumentRegistry {
 
     private DocumentSummary toSummary(ResultSet rs) throws SQLException {
         return new DocumentSummary(
-                rs.getString("filename"),
+                rs.getString("project_id"),
                 rs.getString("document_id"),
+                rs.getString("filename"),
                 rs.getTimestamp("ingested_at").toLocalDateTime(),
                 rs.getInt("chunk_count"),
                 rs.getInt("chunk_size"),

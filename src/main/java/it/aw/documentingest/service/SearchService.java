@@ -6,8 +6,8 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.comparison.IsEqualTo;
 import it.aw.documentingest.model.SearchResult;
-import it.aw.documentingest.registry.DocumentRegistry;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -16,49 +16,39 @@ import java.util.stream.Collectors;
 /**
  * Esegue ricerche semantiche sull'embedding store.
  * <p>
- * Recupera un numero di candidati moltiplicato per SEARCH_MULTIPLIER,
- * filtra i chunk di documenti non più attivi nel registry (orfani),
- * e arricchisce ogni risultato con i metadati di sezione e pagina.
+ * I chunk orfani non esistono più: la cancellazione è fisica, quindi non è necessario
+ * alcun filtraggio post-query sul registry.
  */
 @Service
 public class SearchService {
 
-    private static final int SEARCH_MULTIPLIER = 5;
-
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
-    private final DocumentRegistry registry;
 
     public SearchService(EmbeddingModel embeddingModel,
-                         EmbeddingStore<TextSegment> embeddingStore,
-                         DocumentRegistry registry) {
+                         EmbeddingStore<TextSegment> embeddingStore) {
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
-        this.registry = registry;
     }
 
-    public List<SearchResult> search(String query, int limit) {
+    public List<SearchResult> search(String query, int limit, String projectId) {
         Embedding queryEmbedding = embeddingModel.embed(query).content();
-        List<EmbeddingMatch<TextSegment>> candidates = embeddingStore.search(
-                EmbeddingSearchRequest.builder()
-                        .queryEmbedding(queryEmbedding)
-                        .maxResults(limit * SEARCH_MULTIPLIER)
-                        .build()
-        ).matches();
+        EmbeddingSearchRequest.EmbeddingSearchRequestBuilder builder = EmbeddingSearchRequest.builder()
+                .queryEmbedding(queryEmbedding)
+                .maxResults(limit);
+        if (projectId != null && !projectId.isBlank()) {
+            builder.filter(new IsEqualTo("projectId", projectId));
+        }
+        List<EmbeddingMatch<TextSegment>> candidates = embeddingStore.search(builder.build()).matches();
 
         return candidates.stream()
-                .filter(m -> {
-                    String docId = m.embedded().metadata().getString("documentId");
-                    return docId != null && registry.isActiveDocumentId(docId);
-                })
-                .limit(limit)
                 .map(m -> {
                     var meta = m.embedded().metadata();
                     String  sectionPath  = meta.getString("section.path");
                     String  sectionTitle = meta.getString("section.title");
-                    Integer sectionLevel = toInteger(meta.getString("section.level"));
-                    Integer pageStart    = toInteger(meta.getString("chunk.page_start"));
-                    Integer pageEnd      = toInteger(meta.getString("chunk.page_end"));
+                    Integer sectionLevel = meta.getInteger("section.level");
+                    Integer pageStart    = meta.getInteger("chunk.page_start");
+                    Integer pageEnd      = meta.getInteger("chunk.page_end");
                     return new SearchResult(
                             m.score(),
                             m.embedded().text(),
@@ -74,8 +64,4 @@ public class SearchService {
                 .collect(Collectors.toList());
     }
 
-    private Integer toInteger(String value) {
-        if (value == null) return null;
-        try { return Integer.parseInt(value); } catch (NumberFormatException e) { return null; }
-    }
 }

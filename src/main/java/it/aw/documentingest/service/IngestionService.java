@@ -57,23 +57,38 @@ public class IngestionService {
     }
 
     /** Indicizza un nuovo documento. */
-    public DocumentSummary ingest(MultipartFile file, ChunkingParams params) throws IOException {
+    public DocumentSummary ingest(MultipartFile file, ChunkingParams params, String projectId) throws IOException {
         String filename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown";
-        return doIngest(filename, file, params);
+        return doIngest(filename, file, params, projectId);
+    }
+
+    /**
+     * Rimuove un documento dall'indice: cancella i chunk dall'embedding store
+     * e il record dal registry. Restituisce {@code false} se il documento non esiste.
+     */
+    public boolean delete(String documentId) {
+        Optional<List<String>> chunkIds = registry.remove(documentId);
+        if (chunkIds.isEmpty()) return false;
+        if (!chunkIds.get().isEmpty()) {
+            embeddingStore.removeAll(chunkIds.get());
+        }
+        return true;
     }
 
     /**
      * Sostituisce un documento esistente con una nuova versione.
-     * Il vecchio documentId viene rimosso dal registry; i chunk orfani restano
-     * nello store ma saranno invisibili alle ricerche.
+     * Il projectId viene ereditato dal documento originale.
+     * I chunk della versione precedente vengono rimossi fisicamente dall'embedding store.
+     * Il nuovo documento viene indicizzato con il nome del file caricato e un nuovo documentId.
      */
-    public DocumentSummary reingest(String canonicalFilename, MultipartFile file, ChunkingParams params)
+    public DocumentSummary reingest(String documentId, String projectId, MultipartFile file, ChunkingParams params)
             throws IOException {
-        registry.remove(canonicalFilename);
-        return doIngest(canonicalFilename, file, params);
+        delete(documentId);
+        String newFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown";
+        return doIngest(newFilename, file, params, projectId);
     }
 
-    private DocumentSummary doIngest(String filename, MultipartFile file, ChunkingParams params)
+    private DocumentSummary doIngest(String filename, MultipartFile file, ChunkingParams params, String projectId)
             throws IOException {
         String documentId = UUID.randomUUID().toString();
         log.info("Inizio ingestione: {} — chunkSize={}, overlap={}, documentId={}",
@@ -103,6 +118,7 @@ public class IngestionService {
         Metadata baseMetadata = new Metadata();
         baseMetadata.put("filename", filename);
         baseMetadata.put("documentId", documentId);
+        baseMetadata.put("projectId", projectId);
         Document document = Document.from(fullText, baseMetadata);
         List<TextSegment> segments = splitter.split(document);
 
@@ -111,14 +127,14 @@ public class IngestionService {
 
         // [5] Embedding + store
         List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
-        embeddingStore.addAll(embeddings, segments);
+        List<String> chunkIds = embeddingStore.addAll(embeddings, segments);
 
         // [6] Register
         DocumentRecord record = new DocumentRecord(
-                filename, documentId, LocalDateTime.now(),
+                projectId, documentId, filename, LocalDateTime.now(),
                 segments.size(), params.chunkSize(), params.overlap(),
                 sectionCount, previews);
-        registry.register(record);
+        registry.register(record, chunkIds);
 
         log.info("Ingestione completata: {} — {} chunk, {} sezioni L1 (documentId={})",
                 filename, segments.size(), sectionCount, documentId);

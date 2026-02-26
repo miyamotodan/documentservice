@@ -7,12 +7,13 @@ import java.util.List;
  * Dettaglio completo di un documento indicizzato, incluse le preview dei chunk
  * con metadati di sezione e pagina.
  * <p>
- * Restituito solo da GET /api/documents/{filename}.
+ * Restituito solo da GET /api/documents/{documentId}.
  * Per le operazioni di lista e ingest usare {@link DocumentSummary}.
  */
 public record DocumentRecord(
-        String           filename,
+        String           projectId,         // progetto di appartenenza
         String           documentId,
+        String           filename,
         LocalDateTime    ingestedAt,
         int              chunkCount,
         int              chunkSize,
@@ -22,7 +23,7 @@ public record DocumentRecord(
 ) {
     /** Proietta il record nella vista leggera senza chunk preview. */
     public DocumentSummary toSummary() {
-        return new DocumentSummary(filename, documentId, ingestedAt,
+        return new DocumentSummary(projectId, documentId, filename, ingestedAt,
                 chunkCount, chunkSize, overlap, sectionCount);
     }
 }
